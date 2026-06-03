@@ -92,8 +92,8 @@ jobs:
     runs-on: ${{ fromJson(inputs.review_run_runs_on_json) }}
     permissions:
       contents: read
-      issues: read
-      pull-requests: read
+      issues: write
+      pull-requests: write
     outputs:
       pr_number: ${{ steps.pr_from_dogfood.outputs.pr_number || steps.pr_from_event.outputs.pr_number }}
       head_sha: ${{ steps.pr_from_dogfood.outputs.head_sha || steps.pr_from_event.outputs.head_sha }}
@@ -204,7 +204,7 @@ jobs:
         continue-on-error: true
         uses: actions/create-github-app-token@v3
         with:
-          client-id: ${{ secrets.CODEX_BOT_APP_ID }}
+          app-id: ${{ secrets.CODEX_BOT_APP_ID }}
           private-key: ${{ secrets.CODEX_BOT_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
@@ -744,7 +744,7 @@ jobs:
         if: always() && steps.provider.outputs.github_app_configured == 'true' && steps.auth.outputs.can_run == 'true' && steps.trusted.outputs.available == 'true'
         continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ steps.helper_app_token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.helper_app_token.outputs.token || github.token }}
           BOT_TRIGGER_HANDLE: ${{ inputs.bot_trigger_handle }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
