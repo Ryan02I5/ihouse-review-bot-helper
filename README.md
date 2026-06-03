@@ -26,4 +26,9 @@ jobs:
 
 Secrets stay in the consumer repository. This public helper stores no provider API keys, GitHub App private keys, signing material, or consumer repository credentials.
 
+Inline publish prefers a GitHub App installation token when the consumer has `CODEX_BOT_APP_ID` + `CODEX_BOT_PRIVATE_KEY` and that app is installed on the caller repository. If no installation token is available, advisory publish falls back to the caller workflow token, so consumer jobs should grant at least:
+
+- `issues: write`
+- `pull-requests: write`
+
 Refs Ryan02I5/ihouse-review-bot-helper#1.

@@ -18,6 +18,7 @@ if [ "$failure_comment_policy" = "skip" ]; then
 fi
 trigger_handle="$(resolve_trigger_handle)"
 normalized_bot_login="$(normalize_login_for_allowlist "$trigger_handle")"
+fallback_publish_login="$(normalize_login_for_allowlist "${PUBLISH_FALLBACK_LOGIN:-github-actions[bot]}")"
 source_comment_id="${SOURCE_COMMENT_ID:-}"
 
 source_comment_created_at() {
@@ -195,11 +196,16 @@ success_review_already_exists() {
     reviews_json="$(github_api GET "/repos/$OWNER/$REPO/pulls/$PR_NUMBER/reviews?per_page=100")"
     jq -e \
         --arg normalized_bot "$normalized_bot_login" \
+        --arg fallback_login "$fallback_publish_login" \
         --arg body "$body" \
         --arg since "$since" \
         'map(
             select(
-                (((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $normalized_bot)
+                (
+                  (((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $normalized_bot)
+                  or
+                  (((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $fallback_login)
+                )
                 and (((.submitted_at // .created_at // "")) >= $since)
                 and (((.body // "") | sub("\n$"; "")) == ($body | sub("\n$"; "")))
                 and ((.state // "") == "COMMENTED")
@@ -216,11 +222,16 @@ comment_already_exists() {
     comments_json="$(github_api GET "/repos/$OWNER/$REPO/issues/$PR_NUMBER/comments?per_page=100")"
     jq -e \
         --arg normalized_bot "$normalized_bot_login" \
+        --arg fallback_login "$fallback_publish_login" \
         --arg body "$body" \
         --arg since "$since" \
         'map(
             select(
-                (((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $normalized_bot)
+                (
+                  (((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $normalized_bot)
+                  or
+                  (((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $fallback_login)
+                )
                 and ((($since == "") or ((.created_at // "") >= $since)))
                 and (((.body // "") | sub("\n$"; "")) == ($body | sub("\n$"; "")))
             )
@@ -235,11 +246,16 @@ positive_reaction_already_exists() {
     reactions_json="$(github_api GET "/repos/$OWNER/$REPO/issues/$PR_NUMBER/reactions?per_page=100")"
     jq -e \
         --arg normalized_bot "$normalized_bot_login" \
+        --arg fallback_login "$fallback_publish_login" \
         --arg since "$since" \
         'map(
             select(
                 ((.content // "") == "+1")
-                and ((((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $normalized_bot))
+                and (
+                  (((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $normalized_bot)
+                  or
+                  (((.user.login // "") | ascii_downcase | sub("\\[bot\\]$"; "")) == $fallback_login)
+                )
                 and ((($since == "") or ((.created_at // "") >= $since)))
             )
         ) | length > 0' <<<"$reactions_json" >/dev/null
