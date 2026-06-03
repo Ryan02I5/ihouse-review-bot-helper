@@ -1,0 +1,793 @@
+name: reusable-codex-pr-review
+
+on:
+  workflow_call:
+    # Stable external consumer contract:
+    # - external callers must pin the reusable workflow `uses:` SHA immutably
+    # - external callers must pass the same immutable commit as `helper_ref`
+    # - the pinned workflow SHA plus same-SHA `helper_ref` form one reviewed version set
+    # Same-repo infra dogfood wrappers are allowed to keep repo-local `uses:` shape and
+    # event-snapshot helper resolution; that local wrapper is not part of the external
+    # pinned consumer contract described here.
+    inputs:
+      helper_repository:
+        required: false
+        type: string
+        default: Ryan02I5/ihouse-review-bot-helper
+      helper_ref:
+        required: true
+        type: string
+      bot_trigger_handle:
+        required: true
+        type: string
+      bot_responses_api_endpoint:
+        required: true
+        type: string
+      codex_model:
+        required: true
+        type: string
+      codex_review_model:
+        required: false
+        type: string
+      codex_reasoning_effort:
+        required: true
+        type: string
+      bot_allowed_users:
+        required: false
+        type: string
+      bot_allowed_bots:
+        required: false
+        type: string
+      bot_allowed_bot_users:
+        required: false
+        type: string
+      review_run_runs_on_json:
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+      publish_runs_on_json:
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+      review_run_safety_strategy:
+        required: false
+        type: string
+        default: drop-sudo
+      review_run_codex_user:
+        required: false
+        type: string
+        default: ""
+      # Dogfood-only inputs for same-repo validation. These are not part of the
+      # stable external consumer contract and may evolve with infra-local needs.
+      dogfood_pr_number:
+        required: false
+        type: string
+        default: ""
+      dogfood_review_focus:
+        required: false
+        type: string
+        default: ""
+      dogfood_expected_head_sha:
+        required: false
+        type: string
+        default: ""
+      enforce_findings_gate:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      REVIEW_BOT_PROVIDER_API_KEY:
+        required: false
+      CODEX_PROVIDER_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      CODEX_BOT_APP_ID:
+        required: false
+      CODEX_BOT_PRIVATE_KEY:
+        required: false
+
+jobs:
+  review_run:
+    runs-on: ${{ fromJson(inputs.review_run_runs_on_json) }}
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.pr_from_dogfood.outputs.pr_number || steps.pr_from_event.outputs.pr_number }}
+      head_sha: ${{ steps.pr_from_dogfood.outputs.head_sha || steps.pr_from_event.outputs.head_sha }}
+      review_focus: ${{ steps.parse.outputs.command_text }}
+      review_trigger_mode: ${{ steps.parse.outputs.trigger_mode }}
+      source_key: ${{ steps.parse.outputs.source_key }}
+      skip_reason: ${{ steps.auth.outputs.reason }}
+      publish_review: ${{ steps.auth.outputs.can_run }}
+      trigger_handle: ${{ steps.provider.outputs.trigger_handle }}
+      github_app_configured: ${{ steps.provider.outputs.github_app_configured }}
+      github_app_ready: ${{ steps.trusted.outputs.github_app_ready }}
+      run_status: ${{ steps.review_status.outputs.run_status }}
+      attempt_path: ${{ steps.review_execution.outputs.attempt_path }}
+      failure_class: ${{ steps.review_execution.outputs.failure_class }}
+      artifact_ready: ${{ steps.artifact_status.outputs.ready }}
+      artifact_upload_status: ${{ steps.artifact_status.outputs.upload_status }}
+      findings_count: ${{ steps.prepare_artifact.outputs.findings_count }}
+      findings_summary: ${{ steps.prepare_artifact.outputs.findings_summary }}
+    steps:
+      - name: Checkout workflow sources
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+
+      - name: Resolve Codex runtime
+        id: provider
+        shell: bash
+        env:
+          BOT_TRIGGER_HANDLE: ${{ inputs.bot_trigger_handle }}
+          BOT_RESPONSES_API_ENDPOINT: ${{ inputs.bot_responses_api_endpoint }}
+          CODEX_MODEL: ${{ inputs.codex_model }}
+          CODEX_REVIEW_MODEL: ${{ inputs.codex_review_model }}
+          CODEX_REASONING_EFFORT: ${{ inputs.codex_reasoning_effort }}
+          CODEX_BOT_APP_ID_SECRET: ${{ secrets.CODEX_BOT_APP_ID }}
+          CODEX_BOT_PRIVATE_KEY_SECRET: ${{ secrets.CODEX_BOT_PRIVATE_KEY }}
+          REVIEW_BOT_PROVIDER_API_KEY_SECRET: ${{ secrets.REVIEW_BOT_PROVIDER_API_KEY }}
+          CODEX_PROVIDER_API_KEY_SECRET: ${{ secrets.CODEX_PROVIDER_API_KEY }}
+          OPENAI_API_KEY_SECRET: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          trigger_handle="${BOT_TRIGGER_HANDLE:-ryan-verification-engineer}"
+          trigger_handle="$(printf '%s' "$trigger_handle" | tr '[:upper:]' '[:lower:]')"
+
+          provider_secret_name="CODEX_PROVIDER_API_KEY"
+          provider_secret_ready="false"
+          if [ -n "${REVIEW_BOT_PROVIDER_API_KEY_SECRET:-}" ]; then
+            provider_secret_name="REVIEW_BOT_PROVIDER_API_KEY"
+            provider_secret_ready="true"
+          elif [ -n "${CODEX_PROVIDER_API_KEY_SECRET:-}" ]; then
+            provider_secret_name="CODEX_PROVIDER_API_KEY"
+            provider_secret_ready="true"
+          elif [ -n "${OPENAI_API_KEY_SECRET:-}" ]; then
+            provider_secret_name="OPENAI_API_KEY"
+            provider_secret_ready="true"
+          fi
+
+          github_app_configured="false"
+          if [ -n "${CODEX_BOT_APP_ID_SECRET:-}" ] && [ -n "${CODEX_BOT_PRIVATE_KEY_SECRET:-}" ]; then
+            github_app_configured="true"
+          fi
+
+          {
+            echo "trigger_handle=$trigger_handle"
+            echo "model=${CODEX_MODEL:-}"
+            echo "review_model=${CODEX_REVIEW_MODEL:-${CODEX_MODEL:-}}"
+            echo "reasoning_effort=${CODEX_REASONING_EFFORT:-}"
+            echo "responses_api_endpoint=${BOT_RESPONSES_API_ENDPOINT:-}"
+            echo "supported=true"
+            echo "reason="
+            echo "provider_secret_name=$provider_secret_name"
+            echo "provider_secret_ready=$provider_secret_ready"
+            echo "github_app_configured=$github_app_configured"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve helper repository scope
+        id: helper_scope
+        shell: bash
+        env:
+          HELPER_REPOSITORY: ${{ inputs.helper_repository }}
+          HELPER_REF: ${{ inputs.helper_ref }}
+        run: |
+          canonical_helper_repository="Ryan02I5/ihouse-review-bot-helper"
+          if [ "$HELPER_REPOSITORY" != "$canonical_helper_repository" ]; then
+            echo "Unsupported helper_repository: ${HELPER_REPOSITORY}. Expected ${canonical_helper_repository}." >&2
+            exit 1
+          fi
+          if ! printf '%s' "$HELPER_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "helper_ref must be an immutable 40-character commit SHA: ${HELPER_REF}" >&2
+            exit 1
+          fi
+          helper_owner="${HELPER_REPOSITORY%%/*}"
+          helper_repo="${HELPER_REPOSITORY#*/}"
+          if [ -z "$helper_owner" ] || [ -z "$helper_repo" ] || [ "$helper_owner" = "$helper_repo" ]; then
+            echo "Invalid helper_repository: ${HELPER_REPOSITORY}" >&2
+            exit 1
+          fi
+          echo "helper_owner=$helper_owner" >> "$GITHUB_OUTPUT"
+          {
+            echo "repositories<<__SCOPE__"
+            printf '%s\n' "$helper_repo"
+            echo "__SCOPE__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub App token for caller repo access
+        id: helper_app_token
+        if: steps.provider.outputs.github_app_configured == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CODEX_BOT_APP_ID }}
+          private-key: ${{ secrets.CODEX_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Checkout trusted helper sources
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          repository: ${{ inputs.helper_repository }}
+          ref: ${{ inputs.helper_ref }}
+          path: _trusted_bot_helpers
+          token: ${{ steps.helper_app_token.outputs.token || github.token }}
+
+      - name: Snapshot trusted bot helpers
+        id: trusted
+        env:
+          HELPER_REPOSITORY: ${{ inputs.helper_repository }}
+        shell: bash
+        run: |
+          trusted_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/codex-trusted.XXXXXX")"
+          remote_root="$GITHUB_WORKSPACE/_trusted_bot_helpers/.github/codex"
+          local_root="$GITHUB_WORKSPACE/.github/codex"
+          available="false"
+          source="none"
+          github_app_ready="false"
+          allow_local_fallback="false"
+          trusted_review_agents_file="$trusted_root/review-guidance/AGENTS.md"
+
+          if [ "${{ steps.helper_app_token.outcome || 'skipped' }}" = "success" ] && [ -n "${{ steps.helper_app_token.outputs.token }}" ]; then
+            github_app_ready="true"
+          fi
+
+          if [ "${GITHUB_REPOSITORY}" = "${HELPER_REPOSITORY}" ]; then
+            allow_local_fallback="true"
+          fi
+
+          # Same-repo dogfood must prefer the caller checkout helper sources so helper changes are validated on the current PR head.
+          if [ "$allow_local_fallback" = "true" ] && [ -d "$local_root/scripts" ]; then
+            cp -R "$local_root/." "$trusted_root/"
+            available="true"
+            source="local"
+          elif [ -d "$remote_root/scripts" ]; then
+            cp -R "$remote_root/." "$trusted_root/"
+            available="true"
+            source="remote"
+          fi
+
+          if [ "$available" = "true" ]; then
+            chmod -R a+rX "$trusted_root"
+          fi
+
+          if [ -f "$GITHUB_WORKSPACE/AGENTS.md" ]; then
+            mkdir -p "$(dirname "$trusted_review_agents_file")"
+            cp "$GITHUB_WORKSPACE/AGENTS.md" "$trusted_review_agents_file"
+            chmod a+r "$trusted_review_agents_file"
+          fi
+
+          {
+            echo "trusted_root=$trusted_root"
+            echo "available=$available"
+            echo "source=$source"
+            echo "github_app_ready=$github_app_ready"
+            echo "trusted_review_agents_file=$trusted_review_agents_file"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Parse review trigger
+        id: parse
+        shell: bash
+        env:
+          COMMAND_MODE: review
+          BOT_TRIGGER_HANDLE: ${{ steps.provider.outputs.trigger_handle }}
+          DOGFOOD_PR_NUMBER: ${{ inputs.dogfood_pr_number }}
+          DOGFOOD_REVIEW_FOCUS: ${{ inputs.dogfood_review_focus }}
+        run: |
+          if [ -n "${DOGFOOD_PR_NUMBER:-}" ]; then
+            {
+              echo "should_run=true"
+              echo "trigger_mode=dogfood"
+              echo "command_name=review"
+              echo "command_text=${DOGFOOD_REVIEW_FOCUS:-}"
+              echo "source_key=dogfood-pr-${DOGFOOD_PR_NUMBER}"
+              echo "source_comment_id="
+              echo "trigger_handle=${BOT_TRIGGER_HANDLE}"
+            } >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.trusted.outputs.available }}" = "true" ]; then
+            "${{ steps.trusted.outputs.trusted_root }}/scripts/parse-command.sh" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "should_run=true"
+              echo "trigger_mode=auto"
+              echo "command_name="
+              echo "command_text="
+              echo "source_key=auto"
+              echo "source_comment_id="
+              echo "trigger_handle=${BOT_TRIGGER_HANDLE}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Load PR context
+        id: pr_from_event
+        if: steps.trusted.outputs.available == 'true' && inputs.dogfood_pr_number == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ${{ steps.trusted.outputs.trusted_root }}/scripts/load-pr-context.sh >> "$GITHUB_OUTPUT"
+
+      - name: Load PR context for dogfood target
+        id: pr_from_dogfood
+        if: steps.trusted.outputs.available == 'true' && inputs.dogfood_pr_number != ''
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DOGFOOD_PR_NUMBER: ${{ inputs.dogfood_pr_number }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$(curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${DOGFOOD_PR_NUMBER}")"
+
+          base_ref="$(printf '%s' "$pr_json" | jq -r '.base.ref')"
+          base_sha="$(printf '%s' "$pr_json" | jq -r '.base.sha')"
+          head_ref="$(printf '%s' "$pr_json" | jq -r '.head.ref')"
+          head_sha="$(printf '%s' "$pr_json" | jq -r '.head.sha')"
+          head_repo_full_name="$(printf '%s' "$pr_json" | jq -r '.head.repo.full_name')"
+          is_same_repo="$(printf '%s' "$pr_json" | jq -r --arg repo "$GITHUB_REPOSITORY" 'if .head.repo.full_name == $repo then "true" else "false" end')"
+          is_draft="$(printf '%s' "$pr_json" | jq -r 'if .draft then "true" else "false" end')"
+          pr_title="$(printf '%s' "$pr_json" | jq -r '.title // ""')"
+          pr_body="$(printf '%s' "$pr_json" | jq -r '.body // ""')"
+          pr_url="$(printf '%s' "$pr_json" | jq -r '.html_url')"
+          is_mergeable="$(printf '%s' "$pr_json" | jq -r 'if .mergeable == true then "true" else "false" end')"
+
+          {
+            echo "pr_number=${DOGFOOD_PR_NUMBER}"
+            echo "pr_title=${pr_title}"
+            echo "pr_body<<__PR_BODY__"
+            printf '%s\n' "$pr_body"
+            echo "__PR_BODY__"
+            echo "pr_url=${pr_url}"
+            echo "base_ref=${base_ref}"
+            echo "base_sha=${base_sha}"
+            echo "head_ref=${head_ref}"
+            echo "head_sha=${head_sha}"
+            echo "head_repo_full_name=${head_repo_full_name}"
+            echo "is_same_repo=${is_same_repo}"
+            echo "is_draft=${is_draft}"
+            echo "is_mergeable=${is_mergeable}"
+            echo "merge_ref=refs/pull/${DOGFOOD_PR_NUMBER}/merge"
+            echo "head_checkout_ref=refs/pull/${DOGFOOD_PR_NUMBER}/head"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Enforce dogfood expected head SHA
+        if: steps.trusted.outputs.available == 'true' && inputs.dogfood_pr_number != '' && inputs.dogfood_expected_head_sha != ''
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.dogfood_expected_head_sha }}
+          RESOLVED_HEAD_SHA: ${{ steps.pr_from_dogfood.outputs.head_sha }}
+          DOGFOOD_PR_NUMBER: ${{ inputs.dogfood_pr_number }}
+        run: |
+          set -euo pipefail
+
+          if [ "${RESOLVED_HEAD_SHA}" != "${EXPECTED_HEAD_SHA}" ]; then
+            echo "Dogfood PR #${DOGFOOD_PR_NUMBER} head moved after prepare: expected ${EXPECTED_HEAD_SHA}, got ${RESOLVED_HEAD_SHA}." >&2
+            exit 1
+          fi
+
+      - name: Resolve review auth policy
+        id: auth
+        shell: bash
+        env:
+          PR_IS_SAME_REPO: ${{ steps.pr_from_dogfood.outputs.is_same_repo || steps.pr_from_event.outputs.is_same_repo }}
+          BOT_ALLOWED_USERS: ${{ inputs.bot_allowed_users }}
+          BOT_ALLOWED_BOTS: ${{ inputs.bot_allowed_bots }}
+          PROVIDER_SUPPORTED: ${{ steps.provider.outputs.supported }}
+          PROVIDER_REASON: ${{ steps.provider.outputs.reason }}
+          PROVIDER_SECRET_NAME: ${{ steps.provider.outputs.provider_secret_name }}
+          PROVIDER_SECRET_READY: ${{ steps.provider.outputs.provider_secret_ready }}
+        run: |
+          if [ "${{ steps.trusted.outputs.available }}" = "true" ]; then
+            "${{ steps.trusted.outputs.trusted_root }}/scripts/resolve-review-policy.sh" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "actor_login="
+              echo "actor_type="
+              echo "authorized=false"
+              echo "can_run=false"
+              echo "reason=Trusted helper sources are unavailable, so reusable review execution is skipped."
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve checkout ref
+        id: checkout_ref
+        if: steps.auth.outputs.can_run == 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MERGE_REF: ${{ steps.pr_from_dogfood.outputs.merge_ref || steps.pr_from_event.outputs.merge_ref }}
+          HEAD_CHECKOUT_REF: ${{ steps.pr_from_dogfood.outputs.head_checkout_ref || steps.pr_from_event.outputs.head_checkout_ref }}
+          HEAD_SHA: ${{ steps.pr_from_dogfood.outputs.head_sha || steps.pr_from_event.outputs.head_sha }}
+          PR_IS_MERGEABLE: ${{ steps.pr_from_dogfood.outputs.is_mergeable || steps.pr_from_event.outputs.is_mergeable }}
+        run: |
+          set -euo pipefail
+
+          auth_header="$(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 | tr -d '\n')"
+
+          if [ -n "${MERGE_REF:-}" ] && git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" ls-remote origin "$MERGE_REF" | grep -q .; then
+            echo "checkout_mode=merge_ref" >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=$MERGE_REF" >> "$GITHUB_OUTPUT"
+          else
+            if [ "${PR_IS_MERGEABLE:-false}" = "true" ] && [ -n "${HEAD_CHECKOUT_REF:-}" ]; then
+              echo "checkout_mode=head_ref_fallback" >> "$GITHUB_OUTPUT"
+              echo "checkout_ref=$HEAD_CHECKOUT_REF" >> "$GITHUB_OUTPUT"
+            else
+              echo "Review requires mergeable PR state when merge ref is unavailable; mergeable='${PR_IS_MERGEABLE:-false}' merge_ref='${MERGE_REF:-}'" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Checkout review ref
+        if: steps.auth.outputs.can_run == 'true'
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ steps.checkout_ref.outputs.checkout_ref }}
+
+      - name: Pre-fetch base and head refs
+        if: steps.auth.outputs.can_run == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          auth_header="$(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 | tr -d '\n')"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" fetch --no-tags origin \
+            "${{ steps.pr_from_dogfood.outputs.base_ref || steps.pr_from_event.outputs.base_ref }}" \
+            "+refs/pull/${{ steps.pr_from_dogfood.outputs.pr_number || steps.pr_from_event.outputs.pr_number }}/head"
+
+      - name: Prepare trusted review Codex home
+        id: review_codex_home
+        if: steps.auth.outputs.can_run == 'true'
+        shell: bash
+        env:
+          TRUSTED_ROOT: ${{ steps.trusted.outputs.trusted_root }}
+        run: |
+          codex_home_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/codex-review-home.XXXXXX")"
+          "${TRUSTED_ROOT}/scripts/build-review-codex-home.sh" \
+            "$codex_home_dir" \
+            "${{ steps.trusted.outputs.trusted_review_agents_file }}"
+          chmod -R u+rwX "$codex_home_dir"
+          echo "codex_home_dir=$codex_home_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure low-privilege review user
+        if: steps.auth.outputs.can_run == 'true' && inputs.review_run_safety_strategy == 'unprivileged-user' && inputs.review_run_codex_user != ''
+        shell: bash
+        env:
+          CODEX_USER: ${{ inputs.review_run_codex_user }}
+        run: |
+          set -euo pipefail
+
+          if id "$CODEX_USER" >/dev/null 2>&1; then
+            echo "Review user '$CODEX_USER' already exists."
+            exit 0
+          fi
+
+          runner_group="$(id -gn)"
+          sudo useradd --create-home --shell /bin/bash --gid "$runner_group" "$CODEX_USER"
+          sudo usermod -a -G "$runner_group" "$CODEX_USER"
+          echo "Created review user '$CODEX_USER' with primary group '$runner_group'."
+
+      - name: Grant Codex home ownership to low-privilege review user
+        if: steps.auth.outputs.can_run == 'true' && inputs.review_run_safety_strategy == 'unprivileged-user' && inputs.review_run_codex_user != ''
+        shell: bash
+        env:
+          CODEX_HOME_DIR: ${{ steps.review_codex_home.outputs.codex_home_dir }}
+          CODEX_USER: ${{ inputs.review_run_codex_user }}
+        run: |
+          runner_group="$(id -gn)"
+          sudo chown -R "$CODEX_USER:$runner_group" "$CODEX_HOME_DIR"
+          sudo chmod -R u+rwX,g+rwX,o-rwx "$CODEX_HOME_DIR"
+
+      - name: Bridge shared review Codex home into default codex user home
+        if: steps.auth.outputs.can_run == 'true' && inputs.review_run_safety_strategy == 'unprivileged-user' && inputs.review_run_codex_user != ''
+        shell: bash
+        env:
+          CODEX_HOME_DIR: ${{ steps.review_codex_home.outputs.codex_home_dir }}
+          CODEX_USER: ${{ inputs.review_run_codex_user }}
+        run: |
+          set -euo pipefail
+
+          # openai/codex-action@v1 currently invokes `sudo -u <codex-user>`
+          # without preserving CODEX_HOME, so the explicit `codex-home` input
+          # is ignored in unprivileged-user mode. Keep this as the only
+          # allowed local shim: bridge the trusted shared review home into
+          # the low-privilege user's default `~/.codex` until upstream fixes
+          # that behavior instead of adding a repo-local provider wrapper,
+          # extra proxy hop, or fallback endpoint logic.
+
+          codex_user_home="$(sudo -u "$CODEX_USER" -- printenv HOME)"
+          if [ -z "$codex_user_home" ]; then
+            echo "Could not resolve home for codex user '$CODEX_USER'." >&2
+            exit 1
+          fi
+
+          default_codex_home="$codex_user_home/.codex"
+          sudo -u "$CODEX_USER" -- rm -rf "$default_codex_home"
+          sudo -u "$CODEX_USER" -- ln -s "$CODEX_HOME_DIR" "$default_codex_home"
+
+      - name: Build review prompt
+        if: steps.auth.outputs.can_run == 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr_from_dogfood.outputs.pr_number || steps.pr_from_event.outputs.pr_number }}
+          PR_URL: ${{ steps.pr_from_dogfood.outputs.pr_url || steps.pr_from_event.outputs.pr_url }}
+          PR_TITLE: ${{ steps.pr_from_dogfood.outputs.pr_title || steps.pr_from_event.outputs.pr_title }}
+          PR_BODY: ${{ steps.pr_from_dogfood.outputs.pr_body || steps.pr_from_event.outputs.pr_body }}
+          BASE_REF: ${{ steps.pr_from_dogfood.outputs.base_ref || steps.pr_from_event.outputs.base_ref }}
+          BASE_SHA: ${{ steps.pr_from_dogfood.outputs.base_sha || steps.pr_from_event.outputs.base_sha }}
+          HEAD_REF: ${{ steps.pr_from_dogfood.outputs.head_ref || steps.pr_from_event.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.pr_from_dogfood.outputs.head_sha || steps.pr_from_event.outputs.head_sha }}
+          TRIGGER_MODE: ${{ steps.parse.outputs.trigger_mode }}
+          REVIEW_FOCUS: ${{ steps.parse.outputs.command_text }}
+          MAX_PATCH_FILES: '12'
+          MAX_PATCH_CHARS_PER_FILE: '1200'
+          MAX_PATCH_CHARS_TOTAL: '12000'
+          DIFF_BUNDLE: ${{ runner.temp }}/codex-review-diff-bundle.json
+        run: |
+          ${{ steps.trusted.outputs.trusted_root }}/scripts/build-review-prompt.sh \
+            ${{ steps.trusted.outputs.trusted_root }}/prompts/review.md \
+            "${RUNNER_TEMP:-/tmp}/codex-review-prompt.md"
+
+      - name: Resolve Codex action trusted bot users
+        id: codex_action_bot_users
+        if: steps.auth.outputs.can_run == 'true'
+        shell: bash
+        env:
+          BOT_ALLOWED_BOT_USERS: ${{ inputs.bot_allowed_bot_users }}
+          BOT_ALLOWED_BOTS: ${{ inputs.bot_allowed_bots }}
+        run: |
+          set -euo pipefail
+
+          raw="${BOT_ALLOWED_BOT_USERS:-}"
+          if [ -z "$raw" ]; then
+            raw="${BOT_ALLOWED_BOTS:-}"
+          fi
+
+          trusted_bot_users=""
+          IFS=',' read -r -a items <<< "$raw"
+          for item in "${items[@]}"; do
+            item="$(printf '%s' "$item" | xargs)"
+            if [ -z "$item" ] || [ "$item" = "*" ]; then
+              continue
+            fi
+            if [ -n "$trusted_bot_users" ]; then
+              trusted_bot_users="${trusted_bot_users},${item}"
+            else
+              trusted_bot_users="$item"
+            fi
+          done
+
+          echo "bot_users=$trusted_bot_users" >> "$GITHUB_OUTPUT"
+
+      - name: Run Codex structured review
+        id: run_codex_primary
+        if: steps.auth.outputs.can_run == 'true'
+        continue-on-error: true
+        timeout-minutes: 12
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.REVIEW_BOT_PROVIDER_API_KEY || secrets.CODEX_PROVIDER_API_KEY || secrets.OPENAI_API_KEY }}
+          responses-api-endpoint: ${{ steps.provider.outputs.responses_api_endpoint }}
+          prompt-file: ${{ runner.temp }}/codex-review-prompt.md
+          codex-home: ${{ steps.review_codex_home.outputs.codex_home_dir }}
+          output-schema-file: ${{ steps.trusted.outputs.trusted_root }}/schemas/review-output.schema.json
+          output-file: ${{ steps.review_codex_home.outputs.codex_home_dir }}/codex-review-output.json
+          model: ${{ steps.provider.outputs.review_model }}
+          effort: ${{ steps.provider.outputs.reasoning_effort }}
+          allow-users: ${{ inputs.bot_allowed_users }}
+          allow-bots: ${{ steps.auth.outputs.allow_codex_action_bots == 'true' }}
+          allow-bot-users: ${{ steps.codex_action_bot_users.outputs.bot_users }}
+          safety-strategy: ${{ inputs.review_run_safety_strategy }}
+          codex-user: ${{ inputs.review_run_codex_user }}
+          sandbox: read-only
+
+      - name: Resolve review execution outcome
+        id: review_execution
+        if: steps.auth.outputs.can_run == 'true'
+        env:
+          PRIMARY_OUTCOME: ${{ steps.run_codex_primary.outcome }}
+        run: |
+          set -euo pipefail
+
+          primary_outcome="${PRIMARY_OUTCOME:-skipped}"
+          outcome="$primary_outcome"
+          attempt="none"
+          attempt_path="none"
+          failure_class="none"
+
+          if [ "$primary_outcome" != "skipped" ]; then
+            attempt="primary"
+            attempt_path="primary"
+          fi
+
+          if [ "$outcome" != "success" ] && [ "$outcome" != "skipped" ]; then
+            failure_class="execution_error"
+          fi
+
+          write_output() {
+            local name="$1"
+            local value="${2-}"
+            local marker
+            marker="__CODEX_OUTPUT_$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$marker" "$value" "$marker" >> "$GITHUB_OUTPUT"
+          }
+
+          write_output "outcome" "$outcome"
+          write_output "attempt" "$attempt"
+          write_output "attempt_path" "$attempt_path"
+          write_output "failure_class" "$failure_class"
+
+      - name: Determine review run status
+        id: review_status
+        if: always()
+        env:
+          CAN_RUN: ${{ steps.auth.outputs.can_run }}
+          EXECUTION_OUTCOME: ${{ steps.review_execution.outputs.outcome }}
+        run: |
+          if [ "${CAN_RUN:-false}" = "true" ]; then
+            echo "run_status=${EXECUTION_OUTCOME:-skipped}" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_status=skipped" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare review artifact
+        id: prepare_artifact
+        if: steps.review_status.outputs.run_status == 'success'
+        env:
+          REVIEW_OUTPUT_FILE: ${{ steps.review_codex_home.outputs.codex_home_dir }}/codex-review-output.json
+        run: |
+          set -euo pipefail
+
+          write_output() {
+            local name="$1"
+            local value="${2-}"
+            local marker
+            marker="__CODEX_OUTPUT_$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$marker" "$value" "$marker" >> "$GITHUB_OUTPUT"
+          }
+
+          artifact_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/codex-review-artifact.XXXXXX")"
+          if [ -s "${REVIEW_OUTPUT_FILE}" ]; then
+            artifact_file="$artifact_dir/codex-review-output.json"
+            cp "${REVIEW_OUTPUT_FILE}" "$artifact_file"
+            findings_count="$(jq -r '(.findings // []) | length' "${REVIEW_OUTPUT_FILE}")"
+            findings_summary="$(jq -r '
+              (.findings // [])
+              | .[:3]
+              | map("- " + (.title // "Untitled finding"))
+              | join("\n")
+            ' "${REVIEW_OUTPUT_FILE}")"
+            {
+              echo "ready=true"
+              echo "artifact_dir=$artifact_dir"
+              echo "artifact_file=$artifact_file"
+            } >> "$GITHUB_OUTPUT"
+            write_output "findings_count" "$findings_count"
+            write_output "findings_summary" "$findings_summary"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload review artifact
+        id: upload_artifact
+        if: steps.prepare_artifact.outputs.ready == 'true'
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-review-output
+          path: ${{ steps.prepare_artifact.outputs.artifact_file }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Resolve artifact status
+        id: artifact_status
+        if: always() && steps.review_status.outputs.run_status == 'success'
+        shell: bash
+        env:
+          ARTIFACT_PREPARED: ${{ steps.prepare_artifact.outputs.ready || 'false' }}
+          ARTIFACT_UPLOAD_OUTCOME: ${{ steps.upload_artifact.outcome || 'skipped' }}
+        run: |
+          prepared="${ARTIFACT_PREPARED:-false}"
+          upload_outcome="${ARTIFACT_UPLOAD_OUTCOME:-skipped}"
+          ready="false"
+
+          if [ "$prepared" = "true" ] && [ "$upload_outcome" = "success" ]; then
+            ready="true"
+          fi
+
+          {
+            echo "ready=$ready"
+            echo "upload_status=$upload_outcome"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$prepared" = "true" ] && [ "$upload_outcome" != "success" ]; then
+            {
+              echo "## Review artifact storage warning"
+              echo ""
+              echo "- Artifact upload outcome: ${upload_outcome}"
+              echo "- Review execution itself succeeded; downstream jobs should use fallback review JSON outputs."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Resolve effective publish run status
+        id: publish_status
+        if: always()
+        shell: bash
+        env:
+          REVIEW_RUN_STATUS: ${{ steps.review_status.outputs.run_status }}
+        run: |
+          run_status="${REVIEW_RUN_STATUS:-skipped}"
+          echo "run_status=$run_status" >> "$GITHUB_OUTPUT"
+
+      - name: Download review artifact for publish
+        if: steps.review_status.outputs.run_status == 'success' && steps.artifact_status.outputs.ready == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: codex-review-output
+          path: ${{ runner.temp }}/codex-review-artifact
+
+      - name: Publish review inline
+        id: publish_inline
+        if: always() && steps.provider.outputs.github_app_configured == 'true' && steps.auth.outputs.can_run == 'true' && steps.trusted.outputs.available == 'true'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ steps.helper_app_token.outputs.token }}
+          BOT_TRIGGER_HANDLE: ${{ inputs.bot_trigger_handle }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ steps.pr_from_dogfood.outputs.pr_number || steps.pr_from_event.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr_from_dogfood.outputs.head_sha || steps.pr_from_event.outputs.head_sha }}
+          REVIEW_JSON: ${{ runner.temp }}/codex-review-artifact/codex-review-output.json
+          REVIEW_FINDINGS_COUNT: ${{ steps.prepare_artifact.outputs.findings_count }}
+          REVIEW_FINDINGS_SUMMARY: ${{ steps.prepare_artifact.outputs.findings_summary }}
+          REVIEW_FOCUS: ${{ steps.parse.outputs.command_text }}
+          REVIEW_TRIGGER_MODE: ${{ steps.parse.outputs.trigger_mode }}
+          SOURCE_KEY: ${{ steps.parse.outputs.source_key }}
+          RUN_STATUS: ${{ steps.publish_status.outputs.run_status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          REVIEW_RUN_JOB_NAME: review / review_run
+          FAILURE_CLASS: ${{ steps.review_execution.outputs.failure_class }}
+          ACTIONS_READ_TOKEN: ${{ github.token }}
+          SKIP_REASON: ${{ steps.auth.outputs.reason }}
+          FAILURE_COMMENT_POLICY: ${{ inputs.enforce_findings_gate && 'skip' || 'publish' }}
+        run: ${{ steps.trusted.outputs.trusted_root }}/scripts/publish-review.sh
+
+      - name: Resolve inline publish status
+        id: publish_review_status
+        if: always()
+        shell: bash
+        env:
+          PUBLISH_OUTCOME: ${{ steps.publish_inline.outcome || 'skipped' }}
+          REVIEW_CAN_RUN: ${{ steps.auth.outputs.can_run }}
+          APP_CONFIGURED: ${{ steps.provider.outputs.github_app_configured }}
+          TRUSTED_AVAILABLE: ${{ steps.trusted.outputs.available }}
+        run: |
+          status="skipped"
+          if [ "${REVIEW_CAN_RUN:-false}" = "true" ] && [ "${APP_CONFIGURED:-false}" = "true" ] && [ "${TRUSTED_AVAILABLE:-false}" = "true" ]; then
+            status="${PUBLISH_OUTCOME:-failure}"
+          fi
+          echo "publish_status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Fail review run on execution failure
+        if: always() && steps.review_status.outputs.run_status != 'success' && steps.review_status.outputs.run_status != 'skipped'
+        shell: bash
+        env:
+          RUN_STATUS: ${{ steps.review_status.outputs.run_status }}
+          FAILURE_CLASS: ${{ steps.review_execution.outputs.failure_class }}
+        run: |
+          echo "Review execution failed (run_status=${RUN_STATUS:-unset}, failure_class=${FAILURE_CLASS:-none})." >&2
+          exit 1
